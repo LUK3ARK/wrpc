@@ -146,7 +146,7 @@ mod skip {
         }
     }
 
-    async fn serve_exports(wrpc: &impl wrpc_transport_legacy::Client) {
+    async fn serve_exports(wrpc: &impl wrpc_transport::Client) {
         serve(wrpc, Component, async {}).await.unwrap();
     }
 }
@@ -208,7 +208,7 @@ mod symbol_does_not_conflict {
         }
     }
 
-    async fn serve_exports(wrpc: &impl wrpc_transport_legacy::Client) {
+    async fn serve_exports(wrpc: &impl wrpc_transport::Client) {
         serve(wrpc, Component, async {}).await.unwrap();
     }
 }
@@ -234,7 +234,7 @@ mod alternative_bitflags_path {
     #[derive(Clone)]
     struct Component;
 
-    async fn serve_exports(wrpc: &impl wrpc_transport_legacy::Client) {
+    async fn serve_exports(wrpc: &impl wrpc_transport::Client) {
         serve(wrpc, Component, async {}).await.unwrap();
     }
 
@@ -246,9 +246,6 @@ mod alternative_bitflags_path {
 }
 
 mod owned_resource_deref_mut {
-    use exports::my::inline::foo::BarRep;
-    use wrpc_transport_legacy::{ResourceBorrow, ResourceOwn};
-
     wit_bindgen_wrpc::generate!({
         inline: "
             package my:inline;
@@ -271,35 +268,41 @@ mod owned_resource_deref_mut {
         data: u32,
     }
 
-    impl<Ctx: Send> exports::my::inline::foo::HandlerBar<Ctx> for Component {
-        async fn new(&self, cx: Ctx, data: u32) -> anyhow::Result<ResourceOwn<BarRep>> {
-            todo!();
+    impl<Ctx: Send> exports::my::inline::foo::HandlerBar<Ctx> for MyResource {
+        async fn new(cx: Ctx, data: u32) -> anyhow::Result<Self> {
+            Ok(Self { data })
         }
 
-        async fn get_data(&self, cx: Ctx, self_: ResourceBorrow<BarRep>) -> anyhow::Result<u32> {
-            todo!();
+        async fn get_data(&self, cx: Ctx) -> anyhow::Result<u32> {
+            Ok(self.data)
         }
 
-        async fn consume(&self, cx: Ctx, mut _this: ResourceOwn<BarRep>) -> anyhow::Result<u32> {
-            todo!();
+        async fn consume(cx: Ctx, mut _this: exports::my::inline::foo::Bar) -> anyhow::Result<u32> {
+            todo!("resources not supported at this time")
+            //let me = this.get::<Ctx, MyResource>();
+            //let prior_data: &u32 = &me.data;
+            //let new_data = prior_data + 1;
+            //let me = this.get_mut::<Ctx, MyResource>();
+            //let mutable_data: &mut u32 = &mut me.data;
+            //*mutable_data = new_data;
+            //Ok(me.data)
         }
     }
 
     #[derive(Clone)]
     struct Component;
 
-    impl<Ctx: Send> exports::my::inline::foo::Handler<Ctx> for Component {}
+    impl<Ctx: Send> exports::my::inline::foo::Handler<Ctx> for Component {
+        type Bar = MyResource;
+    }
 
-    async fn serve_exports(wrpc: &impl wrpc_transport_legacy::Client) {
+    async fn serve_exports(wrpc: &impl wrpc_transport::Client) {
         // TODO: Support resources
-        serve(wrpc, Component, async {}).await.unwrap();
+        //serve(wrpc, Component, async {}).await.unwrap();
     }
 }
 
 mod package_with_versions {
-    use exports::my::inline::foo::BarRep;
-    use wrpc_transport_legacy::ResourceOwn;
-
     wit_bindgen_wrpc::generate!({
         inline: "
             package my:inline@0.0.0;
@@ -318,19 +321,22 @@ mod package_with_versions {
 
     pub struct MyResource;
 
-    impl<Ctx: Send> exports::my::inline::foo::HandlerBar<Ctx> for Component {
-        async fn new(&self, cx: Ctx) -> anyhow::Result<ResourceOwn<BarRep>> {
-            todo!();
+    impl<Ctx: Send> exports::my::inline::foo::HandlerBar<Ctx> for MyResource {
+        async fn new(cx: Ctx) -> anyhow::Result<Self> {
+            anyhow::bail!("not supported yet")
         }
     }
 
     #[derive(Clone)]
     struct Component;
 
-    impl<Ctx: Send> exports::my::inline::foo::Handler<Ctx> for Component {}
+    impl<Ctx: Send> exports::my::inline::foo::Handler<Ctx> for Component {
+        type Bar = MyResource;
+    }
 
-    async fn serve_exports(wrpc: &impl wrpc_transport_legacy::Client) {
-        serve(wrpc, Component, async {}).await.unwrap();
+    async fn serve_exports(wrpc: &impl wrpc_transport::Client) {
+        // TODO: Support resources
+        //serve(wrpc, Component, async {}).await.unwrap();
     }
 }
 
@@ -380,7 +386,7 @@ mod custom_derives {
         }
     }
 
-    async fn serve_exports(wrpc: &impl wrpc_transport_legacy::Client) {
+    async fn serve_exports(wrpc: &impl wrpc_transport::Client) {
         serve(wrpc, Component, async {}).await.unwrap();
     }
 }
@@ -542,7 +548,7 @@ mod interface_export_example {
         }
     }
 
-    async fn serve_exports(wrpc: &impl wrpc_transport_legacy::Client) -> anyhow::Result<()> {
+    async fn serve_exports(wrpc: &impl wrpc_transport::Client) -> anyhow::Result<()> {
         serve(wrpc, MyComponent, async {}).await
     }
 }
@@ -576,67 +582,52 @@ mod resource_example {
      "#,
     });
 
-    use exports::my::test::logging::{Handler, HandlerLogger, Level, Logger, LoggerRep};
-    use wrpc_transport_legacy::{ResourceBorrow, ResourceOwn};
+    use exports::my::test::logging::{Handler, HandlerLogger, Level};
 
     #[derive(Clone)]
     struct MyComponent;
 
     // Note that the `logging` interface has no methods of its own but a trait
     // is required to be implemented here to specify the type of `Logger`.
-    impl<Ctx: Send> Handler<Ctx> for MyComponent {}
+    impl<Ctx: Send> Handler<Ctx> for MyComponent {
+        type Logger = MyLogger;
+    }
 
     struct MyLogger {
         level: RwLock<Level>,
         contents: RwLock<String>,
     }
 
-    impl<Ctx: Send> HandlerLogger<Ctx> for MyComponent {
-        async fn new(&self, cx: Ctx, level: Level) -> anyhow::Result<ResourceOwn<LoggerRep>> {
-            todo!();
-
-            // Ok(MyLogger {
-            //     level: RwLock::new(level),
-            //     contents: RwLock::new(String::new()),
-            // })
+    impl<Ctx: Send> HandlerLogger<Ctx> for MyLogger {
+        async fn new(cx: Ctx, level: Level) -> anyhow::Result<MyLogger> {
+            Ok(MyLogger {
+                level: RwLock::new(level),
+                contents: RwLock::new(String::new()),
+            })
         }
 
-        async fn log(
-            &self,
-            cx: Ctx,
-            self_: ResourceBorrow<LoggerRep>,
-            level: Level,
-            msg: String,
-        ) -> anyhow::Result<()> {
-            todo!();
-
-            // if level as u32 <= *self.level.read().unwrap() as u32 {
-            //     self.contents.write().unwrap().push_str(&msg);
-            //     self.contents.write().unwrap().push('\n');
-            // }
-            // Ok(())
+        async fn log(&self, cx: Ctx, level: Level, msg: String) -> anyhow::Result<()> {
+            if level as u32 <= *self.level.read().unwrap() as u32 {
+                self.contents.write().unwrap().push_str(&msg);
+                self.contents.write().unwrap().push('\n');
+            }
+            Ok(())
         }
 
-        async fn level(&self, cx: Ctx, self_: ResourceBorrow<LoggerRep>) -> anyhow::Result<Level> {
-            todo!();
-            // Ok(*self.level.read().unwrap())
+        async fn level(&self, cx: Ctx) -> anyhow::Result<Level> {
+            Ok(*self.level.read().unwrap())
         }
 
-        async fn set_level(
-            &self,
-            cx: Ctx,
-            self_: ResourceBorrow<LoggerRep>,
-            level: Level,
-        ) -> anyhow::Result<()> {
-            todo!();
-
-            // *self.level.write().unwrap() = level;
-            // Ok(())
+        async fn set_level(&self, cx: Ctx, level: Level) -> anyhow::Result<()> {
+            *self.level.write().unwrap() = level;
+            Ok(())
         }
     }
 
-    async fn serve_exports(wrpc: &impl wrpc_transport_legacy::Client) -> anyhow::Result<()> {
-        serve(wrpc, MyComponent, async {}).await
+    async fn serve_exports(wrpc: &impl wrpc_transport::Client) -> anyhow::Result<()> {
+        // TODO: Support resources
+        //serve(wrpc, MyComponent, async {}).await
+        anyhow::bail!("resources not supported yet")
     }
 }
 

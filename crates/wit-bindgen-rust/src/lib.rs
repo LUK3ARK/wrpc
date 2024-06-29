@@ -1,16 +1,13 @@
 use crate::interface::InterfaceGenerator;
 use anyhow::{bail, Result};
-use heck::{ToSnakeCase, ToUpperCamelCase};
+use heck::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::{self, Write as _};
 use std::io::{Read, Write};
 use std::mem;
 use std::process::{Command, Stdio};
 use std::str::FromStr;
-use wit_bindgen_core::wit_parser::{
-    Flags, FlagsRepr, Function, FunctionKind, Int, InterfaceId, PackageId, Resolve, SizeAlign,
-    TypeId, World, WorldId, WorldKey,
-};
+use wit_bindgen_core::wit_parser::*;
 use wit_bindgen_core::{uwriteln, Files, InterfaceGenerator as _, Source, Types, WorldGenerator};
 
 mod interface;
@@ -25,7 +22,7 @@ struct InterfaceName {
 }
 
 #[derive(Default)]
-struct RustWrpc {
+struct RustWasm {
     types: Types,
     src: Source,
     opts: Opts,
@@ -178,18 +175,17 @@ pub struct Opts {
 }
 
 impl Opts {
-    #[must_use]
     pub fn build(self) -> Box<dyn WorldGenerator> {
-        let mut r = RustWrpc::new();
+        let mut r = RustWasm::new();
         r.skip = self.skip.iter().cloned().collect();
         r.opts = self;
         Box::new(r)
     }
 }
 
-impl RustWrpc {
-    fn new() -> RustWrpc {
-        RustWrpc::default()
+impl RustWasm {
+    fn new() -> RustWasm {
+        RustWasm::default()
     }
 
     fn interface<'a>(
@@ -219,7 +215,7 @@ impl RustWrpc {
         let mut map = Module::default();
         for (module, path) in modules {
             let mut cur = &mut map;
-            for name in &path[..path.len() - 1] {
+            for name in path[..path.len() - 1].iter() {
                 cur = cur
                     .submodules
                     .entry(name.clone())
@@ -434,7 +430,7 @@ fn name_package_module(resolve: &Resolve, id: PackageId) -> String {
     format!("{base}{version}")
 }
 
-impl WorldGenerator for RustWrpc {
+impl WorldGenerator for RustWasm {
     fn preprocess(&mut self, resolve: &Resolve, world: WorldId) {
         wit_bindgen_core::generated_preamble(&mut self.src, env!("CARGO_PKG_VERSION"));
 
@@ -460,13 +456,13 @@ impl WorldGenerator for RustWrpc {
                 self.opts.additional_derive_attributes
             );
         }
-        for (k, v) in &self.opts.with {
+        for (k, v) in self.opts.with.iter() {
             uwriteln!(self.src, "//   * with {k:?} = {v:?}");
         }
         self.types.analyze(resolve);
         self.world = Some(world);
 
-        for (k, v) in &self.opts.with {
+        for (k, v) in self.opts.with.iter() {
             self.with.insert(k.clone(), v.clone());
         }
     }
@@ -772,7 +768,6 @@ struct FnSig {
     self_is_first_param: bool,
 }
 
-#[must_use]
 pub fn to_rust_ident(name: &str) -> String {
     match name {
         // Escape Rust keywords.

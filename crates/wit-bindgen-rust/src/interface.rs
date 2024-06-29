@@ -1,26 +1,18 @@
 use crate::{
     int_repr, to_rust_ident, to_upper_camel_case, FnSig, Identifier, InterfaceName, Ownership,
-    RustFlagsRepr, RustWrpc,
+    RustFlagsRepr, RustWasm,
 };
-use heck::{ToShoutySnakeCase, ToSnakeCase, ToUpperCamelCase};
+use heck::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::mem;
-use wit_bindgen_core::{
-    dealias, uwrite, uwriteln,
-    wit_parser::{
-        Docs, Enum, EnumCase, Field, Flags, Function, FunctionKind, Handle, Int, InterfaceId,
-        Record, Resolve, Result_, Results, Tuple, Type, TypeDefKind, TypeId, TypeOwner, Variant,
-        World, WorldKey,
-    },
-    Source, TypeInfo,
-};
+use wit_bindgen_core::{dealias, uwrite, uwriteln, wit_parser::*, Source, TypeInfo};
 
 pub struct InterfaceGenerator<'a> {
     pub src: Source,
     pub(super) identifier: Identifier<'a>,
     pub in_import: bool,
-    pub(super) gen: &'a mut RustWrpc,
+    pub(super) gen: &'a mut RustWasm,
     pub resolve: &'a Resolve,
 }
 
@@ -73,7 +65,7 @@ struct TypeMode {
     ///
     /// This information is used to determine what mode the next layer deep int
     /// he type tree is rendered with. For example if this layer is owned so is
-    /// the next layer. This is primarily used for the "`OnlyTopBorrowed`"
+    /// the next layer. This is primarily used for the "OnlyTopBorrowed"
     /// ownership style where all further layers beneath that are `Owned`.
     style: TypeOwnershipStyle,
 }
@@ -138,7 +130,7 @@ impl InterfaceGenerator<'_> {
         traits.insert(None, ("Handler".to_string(), Vec::new()));
 
         if let Identifier::Interface(id, ..) = identifier {
-            for (name, id) in &self.resolve.interfaces[id].types {
+            for (name, id) in self.resolve.interfaces[id].types.iter() {
                 match self.resolve.types[*id].kind {
                     TypeDefKind::Resource => {}
                     _ => continue,
@@ -170,43 +162,53 @@ impl InterfaceGenerator<'_> {
                 definition: true,
                 ..Default::default()
             };
-            sig.self_arg = Some("&self".into());
-            sig.self_is_first_param = false;
-
+            if let FunctionKind::Method(_) | FunctionKind::Freestanding = &func.kind {
+                sig.self_arg = Some("&self".into());
+                sig.self_is_first_param = true;
+            }
             self.print_docs_and_params(func, true, &sig);
-            match func.results.len() {
-                0 => {
-                    uwrite!(
-                        self.src,
-                        " -> impl ::core::future::Future<Output = {}::Result<()>> + Send",
-                        self.gen.anyhow_path()
-                    );
-                }
-                1 => {
-                    uwrite!(
-                        self.src,
-                        " -> impl ::core::future::Future<Output = {}::Result<",
-                        self.gen.anyhow_path()
-                    );
-                    let ty = func.results.iter_types().next().unwrap();
-                    let mode = self.type_mode_for(ty, TypeOwnershipStyle::Owned, "'INVALID");
-                    assert!(mode.lifetime.is_none());
-                    self.print_ty(ty, mode);
-                    self.push_str(">> + Send");
-                }
-                _ => {
-                    uwrite!(
-                        self.src,
-                        " -> impl ::core::future::Future<Output = {}::Result<(",
-                        self.gen.anyhow_path()
-                    );
-                    for ty in func.results.iter_types() {
+            if let FunctionKind::Constructor(_) = &func.kind {
+                uwrite!(
+                self.src,
+                " -> impl ::core::future::Future<Output = {}::Result<Self>> + Send where Self: Sized",
+                self.gen.anyhow_path()
+            );
+            } else {
+                match func.results.len() {
+                    0 => {
+                        uwrite!(
+                            self.src,
+                            " -> impl ::core::future::Future<Output = {}::Result<()>> + Send",
+                            self.gen.anyhow_path()
+                        );
+                    }
+                    1 => {
+                        uwrite!(
+                            self.src,
+                            " -> impl ::core::future::Future<Output = {}::Result<",
+                            self.gen.anyhow_path()
+                        );
+                        let ty = func.results.iter_types().next().unwrap();
                         let mode = self.type_mode_for(ty, TypeOwnershipStyle::Owned, "'INVALID");
                         assert!(mode.lifetime.is_none());
                         self.print_ty(ty, mode);
-                        self.push_str(", ");
+                        self.push_str(">> + Send");
                     }
-                    self.push_str(")>> + Send");
+                    _ => {
+                        uwrite!(
+                            self.src,
+                            " -> impl ::core::future::Future<Output = {}::Result<(",
+                            self.gen.anyhow_path()
+                        );
+                        for ty in func.results.iter_types() {
+                            let mode =
+                                self.type_mode_for(ty, TypeOwnershipStyle::Owned, "'INVALID");
+                            assert!(mode.lifetime.is_none());
+                            self.print_ty(ty, mode);
+                            self.push_str(", ")
+                        }
+                        self.push_str(")>> + Send")
+                    }
                 }
             }
             self.src.push_str(";\n");
@@ -216,10 +218,16 @@ impl InterfaceGenerator<'_> {
 
         let (name, methods) = traits.remove(&None).unwrap();
         if !methods.is_empty() || !traits.is_empty() {
-            self.generate_interface_trait(&name, &methods);
+            self.generate_interface_trait(
+                &name,
+                &methods,
+                traits.iter().map(|(resource, (trait_name, _methods))| {
+                    (resource.unwrap(), trait_name.as_str())
+                }),
+            )
         }
 
-        for (trait_name, methods) in traits.values() {
+        for (_, (trait_name, methods)) in traits.iter() {
             uwriteln!(self.src, "pub trait {trait_name}<Ctx>: 'static {{");
             for method in methods {
                 self.src.push_str(method);
@@ -227,7 +235,10 @@ impl InterfaceGenerator<'_> {
             uwriteln!(self.src, "}}");
         }
 
-        if funcs_to_export.is_empty() {
+        if !funcs_to_export
+            .iter()
+            .any(|Function { kind, .. }| matches!(kind, FunctionKind::Freestanding))
+        {
             return false;
         }
 
@@ -236,7 +247,13 @@ impl InterfaceGenerator<'_> {
             "pub trait Server<Ctx, Tx: {wrpc_transport}::Transmitter> {{\n",
             wrpc_transport = self.gen.wrpc_transport_path()
         );
-        for Function { params, name, .. } in &funcs_to_export {
+        for Function {
+            kind, params, name, ..
+        } in &funcs_to_export
+        {
+            if !matches!(kind, FunctionKind::Freestanding) {
+                continue;
+            }
             uwrite!(
                 self.src,
                 r#"fn serve_{}(&self, invocation: {wrpc_transport}::AcceptedInvocation<Ctx, ("#,
@@ -249,12 +266,6 @@ impl InterfaceGenerator<'_> {
             }
             uwriteln!(self.src, r#"), Tx>);"#,);
         }
-
-        let trait_names: Vec<_> = traits
-            .values()
-            .map(|(name, _)| format!("{name}<Ctx> + "))
-            .collect();
-
         uwrite!(
             self.src,
             r#"
@@ -264,18 +275,18 @@ impl InterfaceGenerator<'_> {
 impl <Ctx, T, Tx> Server<Ctx, Tx> for T
     where
         Ctx: Send + 'static,
-        T: Handler<Ctx> + {resource_traits} Send + Sync + Clone + 'static,
+        T: Handler<Ctx> + Send + Sync + Clone + 'static,
         Tx: {wrpc_transport}::Transmitter + Send + 'static,
     {{"#,
-            wrpc_transport = self.gen.wrpc_transport_path(),
-            resource_traits = trait_names.join("")
+            wrpc_transport = self.gen.wrpc_transport_path()
         );
-
-        for func in &funcs_to_export {
-            let Function {
-                kind, params, name, ..
-            } = func;
-
+        for Function {
+            kind, params, name, ..
+        } in &funcs_to_export
+        {
+            if !matches!(kind, FunctionKind::Freestanding) {
+                continue;
+            }
             let method_name = format!("serve_{name}", name = name.to_snake_case());
             uwrite!(
                 self.src,
@@ -297,29 +308,6 @@ fn {method_name}(
                 self.print_ty(ty, TypeMode::owned());
                 self.push_str(",");
             }
-
-            let (handler_name, func_name) = match kind {
-                FunctionKind::Freestanding => ("Handler".to_string(), name.as_str()),
-                FunctionKind::Method(id) => {
-                    let resource_name = self.resolve.types[*id].name.as_ref().unwrap();
-                    let handler = format!("Handler{}", resource_name.to_upper_camel_case());
-
-                    (handler, func.item_name())
-                }
-                FunctionKind::Static(id) => {
-                    let resource_name = self.resolve.types[*id].name.as_ref().unwrap();
-                    let handler = format!("Handler{}", resource_name.to_upper_camel_case());
-
-                    (handler, func.item_name())
-                }
-                FunctionKind::Constructor(id) => {
-                    let resource_name = self.resolve.types[*id].name.as_ref().unwrap();
-                    let handler = format!("Handler{}", resource_name.to_upper_camel_case());
-
-                    (handler, "new")
-                }
-            };
-
             uwrite!(
                 self.src,
                 r#"),
@@ -329,8 +317,8 @@ fn {method_name}(
             let _enter = span.enter();
             let handler = self.clone();
             {tokio}::spawn(async move {{
-                match {handler_name}::{name}(&handler, context, "#,
-                name = to_rust_ident(func_name),
+                match handler.{name}(context, "#,
+                name = to_rust_ident(name),
                 tokio = self.gen.tokio_path(),
                 tracing = self.gen.tracing_path(),
             );
@@ -378,7 +366,10 @@ pub async fn serve_interface<T: {wrpc_transport}::Client, U>(
             tracing = self.gen.tracing_path(),
             wrpc_transport = self.gen.wrpc_transport_path()
         );
-        for Function { name, .. } in &funcs_to_export {
+        for Function { kind, name, .. } in &funcs_to_export {
+            if !matches!(kind, FunctionKind::Freestanding) {
+                continue;
+            }
             uwrite!(self.src, "{},", to_rust_ident(name));
         }
         uwrite!(
@@ -414,7 +405,10 @@ pub async fn serve_interface<T: {wrpc_transport}::Client, U>(
                 }
             }
         };
-        for Function { name, .. } in &funcs_to_export {
+        for Function { kind, name, .. } in &funcs_to_export {
+            if !matches!(kind, FunctionKind::Freestanding) {
+                continue;
+            }
             uwrite!(
                 self.src,
                 r#"async {{ wrpc.serve_static("{instance}", "{name}").await.context("failed to serve `{instance}.{name}`") }}.instrument({tracing}::trace_span!("serve_interface")),"#,
@@ -422,7 +416,10 @@ pub async fn serve_interface<T: {wrpc_transport}::Client, U>(
             );
         }
         self.push_str(")?;\n");
-        for Function { name, .. } in &funcs_to_export {
+        for Function { kind, name, .. } in &funcs_to_export {
+            if !matches!(kind, FunctionKind::Freestanding) {
+                continue;
+            }
             let name = to_rust_ident(name);
             uwrite!(self.src, "let mut {name} = ::core::pin::pin!({name});\n",);
         }
@@ -434,7 +431,10 @@ pub async fn serve_interface<T: {wrpc_transport}::Client, U>(
             tokio = self.gen.tokio_path()
         );
 
-        for Function { name, .. } in &funcs_to_export {
+        for Function { kind, name, .. } in &funcs_to_export {
+            if !matches!(kind, FunctionKind::Freestanding) {
+                continue;
+            }
             uwriteln!(
                 self.src,
                 "invocation = {}.next() => {{",
@@ -481,8 +481,21 @@ pub async fn serve_interface<T: {wrpc_transport}::Client, U>(
         true
     }
 
-    fn generate_interface_trait(&mut self, trait_name: &str, methods: &[Source]) {
+    fn generate_interface_trait<'a>(
+        &mut self,
+        trait_name: &str,
+        methods: &[Source],
+        resource_traits: impl Iterator<Item = (TypeId, &'a str)>,
+    ) {
         uwriteln!(self.src, "pub trait {trait_name}<Ctx> {{");
+        for (id, trait_name) in resource_traits {
+            let name = self.resolve.types[id]
+                .name
+                .as_ref()
+                .unwrap()
+                .to_upper_camel_case();
+            uwriteln!(self.src, "type {name}: {trait_name}<Ctx>;");
+        }
         for method in methods {
             self.src.push_str(method);
         }
@@ -552,7 +565,7 @@ pub async fn serve_interface<T: {wrpc_transport}::Client, U>(
         } else {
             &mut self.gen.export_modules
         };
-        map.push((module, module_path));
+        map.push((module, module_path))
     }
 
     fn generate_guest_import(&mut self, instance: &str, func: &Function) {
@@ -562,40 +575,37 @@ pub async fn serve_interface<T: {wrpc_transport}::Client, U>(
 
         let mut sig = FnSig::default();
         match func.kind {
-            FunctionKind::Method(id) => {
-                let name = self.resolve.types[id].name.as_ref().unwrap();
-                let name = to_upper_camel_case(name);
-                uwriteln!(self.src, "impl {name} {{");
-
-                sig.use_item_name = true;
-                sig.self_arg = Some("&self".into());
-                sig.self_is_first_param = true;
-            }
-            FunctionKind::Static(id) | FunctionKind::Constructor(id) => {
-                let name = self.resolve.types[id].name.as_ref().unwrap();
-                let name = to_upper_camel_case(name);
-                uwriteln!(self.src, "impl {name} {{");
-
-                sig.use_item_name = true;
-            }
             FunctionKind::Freestanding => {}
+            FunctionKind::Method(id) | FunctionKind::Static(id) | FunctionKind::Constructor(id) => {
+                let name = self.resolve.types[id].name.as_ref().unwrap();
+                let name = to_upper_camel_case(name);
+                uwriteln!(self.src, "impl {name} {{");
+                sig.use_item_name = true;
+                if let FunctionKind::Method(_) = &func.kind {
+                    sig.self_arg = Some("&self".into());
+                    sig.self_is_first_param = true;
+                }
+            }
         }
         self.src.push_str("#[allow(clippy::all)]\n");
-
-        let mut params = self.print_signature(func, false, &sig);
-        if sig.self_is_first_param {
-            params.insert(0, "self.handle.as_ref()".to_string());
-        }
-
+        let params = self.print_signature(func, false, &sig);
         self.src.push_str("{\n");
         let anyhow = self.gen.anyhow_path();
         uwriteln!(self.src, "use {anyhow}::Context as _;");
         self.src.push_str("let wrpc__ = wrpc__.invoke_static(");
-        uwrite!(self.src, r#""{instance}""#);
+        match func.kind {
+            FunctionKind::Freestanding
+            | FunctionKind::Static(..)
+            | FunctionKind::Constructor(..) => {
+                uwrite!(self.src, r#""{instance}""#);
+            }
+            FunctionKind::Method(..) => {
+                self.src.push_str("&self.0");
+            }
+        }
         self.src.push_str(r#", ""#);
         self.src.push_str(&func.name);
         self.src.push_str(r#"", "#);
-
         match &params[..] {
             [] => self.src.push_str("()"),
             [p] => self.src.push_str(p),
@@ -635,16 +645,17 @@ pub async fn serve_interface<T: {wrpc_transport}::Client, U>(
 
         let root_methods = funcs.remove(&None).unwrap_or(Vec::new());
 
-        let extra_trait_items = String::new();
+        let mut extra_trait_items = String::new();
         let guest_trait = match interface {
             Some((id, _)) => {
                 let path = self.path_to_interface(id).unwrap();
-                for (name, id) in &self.resolve.interfaces[id].types {
+                for (name, id) in self.resolve.interfaces[id].types.iter() {
                     match self.resolve.types[*id].kind {
                         TypeDefKind::Resource => {}
                         _ => continue,
                     }
                     let camel = name.to_upper_camel_case();
+                    uwriteln!(extra_trait_items, "type {camel} = Stub;");
 
                     let resource_methods = funcs.remove(&Some(*id)).unwrap_or(Vec::new());
                     let trait_name = format!("{path}::Handler{camel}");
@@ -681,9 +692,10 @@ pub async fn serve_interface<T: {wrpc_transport}::Client, U>(
                 private: true,
                 ..Default::default()
             };
-            sig.self_arg = Some("&self".into());
-            sig.self_is_first_param = false;
-
+            if let FunctionKind::Method(_) | FunctionKind::Freestanding = &func.kind {
+                sig.self_arg = Some("&self".into());
+                sig.self_is_first_param = true;
+            }
             self.print_signature(func, true, &sig);
             self.src.push_str("{ unreachable!() }\n");
         }
@@ -744,8 +756,15 @@ pub async fn serve_interface<T: {wrpc_transport}::Client, U>(
 
     fn print_signature(&mut self, func: &Function, params_owned: bool, sig: &FnSig) -> Vec<String> {
         let params = self.print_docs_and_params(func, params_owned, sig);
-        self.print_results(&func.results);
-
+        if let FunctionKind::Constructor(_) = &func.kind {
+            uwrite!(
+                self.src,
+                " -> {anyhow}::Result<Self> where Self: Sized",
+                anyhow = self.gen.anyhow_path()
+            );
+        } else {
+            self.print_results(&func.results);
+        }
         params
     }
 
@@ -765,7 +784,7 @@ pub async fn serve_interface<T: {wrpc_transport}::Client, U>(
         }
         if !sig.definition {
             // This exists just to work around compiler bug https://github.com/rust-lang/rust/issues/100013
-            self.push_str("async ");
+            self.push_str("async ")
         }
         self.push_str("fn ");
         let func_name = if sig.use_item_name {
@@ -777,7 +796,6 @@ pub async fn serve_interface<T: {wrpc_transport}::Client, U>(
         } else {
             &func.name
         };
-
         self.push_str(&to_rust_ident(func_name));
         self.push_str("(");
         if self.in_import {
@@ -785,7 +803,6 @@ pub async fn serve_interface<T: {wrpc_transport}::Client, U>(
                 self.push_str(arg);
                 self.push_str(",");
             }
-
             self.push_str("wrpc__: &impl ");
             let wrpc_transport = self.gen.wrpc_transport_path().to_string();
             self.push_str(&wrpc_transport);
@@ -799,10 +816,12 @@ pub async fn serve_interface<T: {wrpc_transport}::Client, U>(
         }
         let mut params = Vec::new();
         for (i, (name, param)) in func.params.iter().enumerate() {
-            if i == 0 && sig.self_is_first_param {
-                continue;
+            if let FunctionKind::Method(..) = &func.kind {
+                if i == 0 && sig.self_is_first_param {
+                    params.push("self".to_string());
+                    continue;
+                }
             }
-
             let name = to_rust_ident(name);
             self.push_str(&name);
             self.push_str(": ");
@@ -896,9 +915,9 @@ pub async fn serve_interface<T: {wrpc_transport}::Client, U>(
                     let mode = self.type_mode_for(ty, TypeOwnershipStyle::Owned, "'INVALID");
                     assert!(mode.lifetime.is_none());
                     self.print_ty(ty, mode);
-                    self.push_str(", ");
+                    self.push_str(", ")
                 }
-                self.push_str(")>");
+                self.push_str(")>")
             }
         }
     }
@@ -1106,7 +1125,7 @@ pub async fn serve_interface<T: {wrpc_transport}::Client, U>(
         match ty {
             Some(ty) => {
                 let mode = self.filter_mode_preserve_top(ty, mode);
-                self.print_ty(ty, mode);
+                self.print_ty(ty, mode)
             }
             None => self.push_str("()"),
         }
@@ -1169,16 +1188,6 @@ pub async fn serve_interface<T: {wrpc_transport}::Client, U>(
                 },
             );
             self.push_str(&name);
-
-            if let TypeDefKind::Resource = ty.kind {
-                match mode.style {
-                    TypeOwnershipStyle::Owned => {}
-                    TypeOwnershipStyle::OnlyTopBorrowed | TypeOwnershipStyle::Borrowed => {
-                        self.push_str("Borrow");
-                    }
-                };
-            }
-
             return;
         }
 
@@ -1207,7 +1216,7 @@ pub async fn serve_interface<T: {wrpc_transport}::Client, U>(
             // appropriately handle 1-tuples.
             TypeDefKind::Tuple(t) => {
                 self.push_str("(");
-                for ty in &t.types {
+                for ty in t.types.iter() {
                     let mode = self.filter_mode_preserve_top(ty, mode);
                     self.print_ty(ty, mode);
                     self.push_str(",");
@@ -1314,29 +1323,29 @@ pub async fn serve_interface<T: {wrpc_transport}::Client, U>(
             self.push_str("let ");
             self.push_str(name.trim_start_matches('&'));
             self.push_str("{\n");
-            for Field { name, .. } in &ty.fields {
+            for Field { name, .. } in ty.fields.iter() {
                 let name_rust = to_rust_ident(name);
-                uwriteln!(self.src, "{name_rust}: f_{name_rust},");
+                uwriteln!(self.src, "{name_rust}: f_{name_rust},")
             }
             self.push_str("} = self;\n");
-            for Field { name, .. } in &ty.fields {
+            for Field { name, .. } in ty.fields.iter() {
                 let name_rust = to_rust_ident(name);
                 uwriteln!(
                     self.src,
                     r#"let f_{name_rust} = f_{name_rust}.encode(&mut payload).await.context("failed to encode `{name}`")?;"#,
-                );
+                )
             }
             self.push_str("if false");
-            for Field { name, .. } in &ty.fields {
-                uwrite!(self.src, r#" || f_{}.is_some()"#, to_rust_ident(name));
+            for Field { name, .. } in ty.fields.iter() {
+                uwrite!(self.src, r#" || f_{}.is_some()"#, to_rust_ident(name))
             }
             self.push_str("{\n");
             uwrite!(
                 self.src,
                 "return Ok(Some({wrpc_transport}::AsyncValue::Record(vec!["
             );
-            for Field { name, .. } in &ty.fields {
-                uwrite!(self.src, r#"f_{},"#, to_rust_ident(name));
+            for Field { name, .. } in ty.fields.iter() {
+                uwrite!(self.src, r#"f_{},"#, to_rust_ident(name))
             }
             self.push_str("\n])))}\n");
         }
@@ -1370,19 +1379,19 @@ pub async fn serve_interface<T: {wrpc_transport}::Client, U>(
                 uwrite!(
                     self.src,
                     r#">::subscribe(subscriber, subject.child(Some({i}))).await?;"#,
-                );
+                )
             }
             self.push_str("if false");
-            for Field { name, .. } in &ty.fields {
-                uwrite!(self.src, r#" || f_{}.is_some()"#, to_rust_ident(name));
+            for Field { name, .. } in ty.fields.iter() {
+                uwrite!(self.src, r#" || f_{}.is_some()"#, to_rust_ident(name))
             }
             self.push_str("{\n");
             uwrite!(
                 self.src,
                 "return Ok(Some({wrpc_transport}::AsyncSubscription::Record(vec!["
             );
-            for Field { name, .. } in &ty.fields {
-                uwrite!(self.src, r#"f_{},"#, to_rust_ident(name));
+            for Field { name, .. } in ty.fields.iter() {
+                uwrite!(self.src, r#"f_{},"#, to_rust_ident(name))
             }
             self.push_str("\n])))}\n");
         }
@@ -1433,13 +1442,13 @@ pub async fn serve_interface<T: {wrpc_transport}::Client, U>(
                     )
                     .await
                     .context("failed to receive `{name}`")?;"#,
-                );
+                )
             }
         }
         self.push_str("Ok((Self {\n");
-        for Field { name, .. } in &ty.fields {
+        for Field { name, .. } in ty.fields.iter() {
             let name_rust = to_rust_ident(name);
-            uwrite!(self.src, r#"{name_rust}: f_{name_rust},"#);
+            uwrite!(self.src, r#"{name_rust}: f_{name_rust},"#)
         }
         self.push_str("\n}, payload))\n");
         self.push_str("}\n");
@@ -1520,13 +1529,13 @@ pub async fn serve_interface<T: {wrpc_transport}::Client, U>(
                 uwrite!(
                     self.src,
                     r#">::subscribe(subscriber, subject.child(Some({i}))).await?;"#,
-                );
+                )
             }
         }
         self.push_str("if false");
         for (i, (_, _, payload)) in cases.clone().into_iter().enumerate() {
             if payload.is_some() {
-                uwrite!(self.src, r#" || c_{i}.is_some()"#);
+                uwrite!(self.src, r#" || c_{i}.is_some()"#)
             }
         }
         self.push_str("{\n");
@@ -1536,7 +1545,7 @@ pub async fn serve_interface<T: {wrpc_transport}::Client, U>(
         );
         for (i, (_, _, payload)) in cases.into_iter().enumerate() {
             if payload.is_some() {
-                uwrite!(self.src, r#"c_{i},"#);
+                uwrite!(self.src, r#"c_{i},"#)
             } else {
                 self.push_str("None,");
             }
@@ -1606,7 +1615,7 @@ pub async fn serve_interface<T: {wrpc_transport}::Client, U>(
                     }}"#
                 );
             } else {
-                uwriteln!(self.src, "Ok((Self::{case_name}, payload)),");
+                uwriteln!(self.src, "Ok((Self::{case_name}, payload)),")
             }
         }
         uwriteln!(
@@ -1757,22 +1766,18 @@ pub async fn serve_interface<T: {wrpc_transport}::Client, U>(
             let mut derives = additional_derives.clone();
             if info.is_copy() {
                 self.push_str("#[repr(C)]\n");
-                derives.extend(
-                    ["Copy", "Clone"]
-                        .into_iter()
-                        .map(std::string::ToString::to_string),
-                );
+                derives.extend(["Copy", "Clone"].into_iter().map(|s| s.to_string()));
             } else if info.is_clone() {
                 derives.insert("Clone".to_string());
             }
             if !derives.is_empty() {
                 self.push_str("#[derive(");
                 self.push_str(&derives.into_iter().collect::<Vec<_>>().join(", "));
-                self.push_str(")]\n");
+                self.push_str(")]\n")
             }
-            self.push_str(&format!("pub struct {name}"));
+            self.push_str(&format!("pub struct {}", name));
             self.push_str(" {\n");
-            for Field { name, ty, docs } in &record.fields {
+            for Field { name, ty, docs } in record.fields.iter() {
                 self.rustdoc(docs);
                 self.push_str("pub ");
                 self.push_str(&to_rust_ident(name));
@@ -1795,8 +1800,8 @@ pub async fn serve_interface<T: {wrpc_transport}::Client, U>(
             self.push_str(
                 "fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {\n",
             );
-            self.push_str(&format!("f.debug_struct(\"{name}\")"));
-            for field in &record.fields {
+            self.push_str(&format!("f.debug_struct(\"{}\")", name));
+            for field in record.fields.iter() {
                 self.push_str(&format!(
                     ".field(\"{}\", &self.{})",
                     field.name,
@@ -1863,18 +1868,14 @@ pub async fn serve_interface<T: {wrpc_transport}::Client, U>(
             self.rustdoc(docs);
             let mut derives = additional_derives.clone();
             if info.is_copy() {
-                derives.extend(
-                    ["Copy", "Clone"]
-                        .into_iter()
-                        .map(std::string::ToString::to_string),
-                );
+                derives.extend(["Copy", "Clone"].into_iter().map(|s| s.to_string()));
             } else if info.is_clone() {
                 derives.insert("Clone".to_string());
             }
             if !derives.is_empty() {
                 self.push_str("#[derive(");
                 self.push_str(&derives.into_iter().collect::<Vec<_>>().join(", "));
-                self.push_str(")]\n");
+                self.push_str(")]\n")
             }
             self.push_str(&format!("pub enum {name}"));
             self.push_str(" {\n");
@@ -1884,7 +1885,7 @@ pub async fn serve_interface<T: {wrpc_transport}::Client, U>(
                 if let Some(ty) = payload {
                     self.push_str("(");
                     self.print_ty(ty, TypeMode::owned());
-                    self.push_str(")");
+                    self.push_str(")")
                 }
                 self.push_str(",\n");
             }
@@ -1952,7 +1953,7 @@ pub async fn serve_interface<T: {wrpc_transport}::Client, U>(
                 self.push_str("(e)");
             }
             self.push_str(" => {\n");
-            self.push_str(&format!("f.debug_tuple(\"{name}::{case_name}\")"));
+            self.push_str(&format!("f.debug_tuple(\"{}::{}\")", name, case_name));
             if payload.is_some() {
                 self.push_str(".field(e)");
             }
@@ -1967,7 +1968,7 @@ pub async fn serve_interface<T: {wrpc_transport}::Client, U>(
     fn print_typedef_option(&mut self, id: TypeId, payload: &Type, docs: &Docs) {
         for (name, mode) in self.modes_of(id) {
             self.rustdoc(docs);
-            self.push_str(&format!("pub type {name}"));
+            self.push_str(&format!("pub type {}", name));
             self.push_str("= Option<");
             self.print_ty(payload, mode);
             self.push_str(">;\n");
@@ -1977,7 +1978,7 @@ pub async fn serve_interface<T: {wrpc_transport}::Client, U>(
     fn print_typedef_result(&mut self, id: TypeId, result: &Result_, docs: &Docs) {
         for (name, mode) in self.modes_of(id) {
             self.rustdoc(docs);
-            self.push_str(&format!("pub type {name}"));
+            self.push_str(&format!("pub type {}", name));
             self.push_str("= Result<");
             self.print_optional_ty(result.ok.as_ref(), mode);
             self.push_str(",");
@@ -2002,7 +2003,7 @@ pub async fn serve_interface<T: {wrpc_transport}::Client, U>(
         let name = to_upper_camel_case(name);
         self.rustdoc(docs);
         for attr in attrs {
-            self.push_str(&format!("{attr}\n"));
+            self.push_str(&format!("{}\n", attr));
         }
         self.push_str("#[repr(");
         self.int_repr(enum_.tag());
@@ -2018,13 +2019,13 @@ pub async fn serve_interface<T: {wrpc_transport}::Client, U>(
         derives.extend(
             ["Clone", "Copy", "PartialEq", "Eq"]
                 .into_iter()
-                .map(std::string::ToString::to_string),
+                .map(|s| s.to_string()),
         );
         self.push_str("#[derive(");
         self.push_str(&derives.into_iter().collect::<Vec<_>>().join(", "));
         self.push_str(")]\n");
         self.push_str(&format!("pub enum {name} {{\n"));
-        for case in &enum_.cases {
+        for case in enum_.cases.iter() {
             self.rustdoc(&case.docs);
             self.push_str(&case_attr(case));
             self.push_str(&case.name.to_upper_camel_case());
@@ -2041,7 +2042,7 @@ pub async fn serve_interface<T: {wrpc_transport}::Client, U>(
 
             self.push_str("pub fn name(&self) -> &'static str {\n");
             self.push_str("match self {\n");
-            for case in &enum_.cases {
+            for case in enum_.cases.iter() {
                 self.push_str(&name);
                 self.push_str("::");
                 self.push_str(&case.name.to_upper_camel_case());
@@ -2054,7 +2055,7 @@ pub async fn serve_interface<T: {wrpc_transport}::Client, U>(
 
             self.push_str("pub fn message(&self) -> &'static str {\n");
             self.push_str("match self {\n");
-            for case in &enum_.cases {
+            for case in enum_.cases.iter() {
                 self.push_str(&name);
                 self.push_str("::");
                 self.push_str(&case.name.to_upper_camel_case());
@@ -2106,43 +2107,28 @@ pub async fn serve_interface<T: {wrpc_transport}::Client, U>(
                     .cases
                     .iter()
                     .map(|c| (c.name.to_upper_camel_case(), None)),
-            );
+            )
         }
     }
 
     fn print_typedef_alias(&mut self, id: TypeId, ty: &Type, docs: &Docs) {
-        if self.is_exported_resource(id) {
-            let Type::Id(resource_id) = ty else {
-                unreachable!()
-            };
-            let resource_name = self.type_path(*resource_id, true);
-
-            // owned resource
+        for (name, mode) in self.modes_of(id) {
             self.rustdoc(docs);
-            let name = self.resolve.types[id].name.as_ref().unwrap();
-            let name = name.to_upper_camel_case();
             self.push_str(&format!("pub type {name}"));
             self.push_str(" = ");
-            self.push_str(&resource_name);
+            self.print_ty(ty, mode);
             self.push_str(";\n");
+        }
 
-            // borrowed resource
+        if self.is_exported_resource(id) {
             self.rustdoc(docs);
             let name = self.resolve.types[id].name.as_ref().unwrap();
             let name = name.to_upper_camel_case();
             self.push_str(&format!("pub type {name}Borrow"));
             self.push_str(" = ");
-            self.push_str(&resource_name);
+            self.print_ty(ty, TypeMode::owned());
             self.push_str("Borrow");
             self.push_str(";\n");
-        } else {
-            for (name, mode) in self.modes_of(id) {
-                self.rustdoc(docs);
-                self.push_str(&format!("pub type {name}"));
-                self.push_str(" = ");
-                self.print_ty(ty, mode);
-                self.push_str(";\n");
-            }
         }
     }
 
@@ -2150,7 +2136,7 @@ pub async fn serve_interface<T: {wrpc_transport}::Client, U>(
         let info = self.info(ty);
         let name = to_upper_camel_case(self.resolve.types[ty].name.as_ref().unwrap());
         if self.uses_two_names(&info) {
-            format!("{name}Param")
+            format!("{}Param", name)
         } else {
             name
         }
@@ -2160,7 +2146,7 @@ pub async fn serve_interface<T: {wrpc_transport}::Client, U>(
         let info = self.info(ty);
         let name = to_upper_camel_case(self.resolve.types[ty].name.as_ref().unwrap());
         if self.uses_two_names(&info) {
-            format!("{name}Result")
+            format!("{}Result", name)
         } else {
             name
         }
@@ -2266,35 +2252,22 @@ impl<'a> wit_bindgen_core::InterfaceGenerator<'a> for InterfaceGenerator<'a> {
     }
 
     fn type_resource(&mut self, _id: TypeId, name: &str, docs: &Docs) {
-        // TODO: Refactor the resource handle unit structs to not have the "Rep" suffix
-
         self.rustdoc(docs);
         let camel = to_upper_camel_case(name);
 
-        let wrpc_transport = self.gen.wrpc_transport_path();
         let anyhow = self.gen.anyhow_path();
         let async_trait = self.gen.async_trait_path();
         let bytes = self.gen.bytes_path();
         let futures = self.gen.futures_path();
         let tracing = self.gen.tracing_path();
+        let wrpc_transport = self.gen.wrpc_transport_path();
 
         if self.in_import {
-            // TODO: Refactor to use extension traits for Resource{Own,Borrow} instead defining a wrapper struct
             uwriteln!(
                 self.src,
                 r#"
-#[derive(Debug, Clone, Copy)]
-pub struct {camel}Rep;
-
 #[derive(Debug)]
-pub struct {camel} {{
-    pub handle: {wrpc_transport}::ResourceOwn<{camel}Rep>
-}}
-
-#[derive(Debug)]
-pub struct {camel}Borrow {{
-    pub handle: {wrpc_transport}::ResourceBorrow<{camel}Rep>
-}}
+pub struct {camel}(String);
 
 #[{async_trait}::async_trait]
 #[automatically_derived]
@@ -2302,7 +2275,7 @@ impl {wrpc_transport}::Encode for {camel} {{
      async fn encode(self, payload: &mut (impl {bytes}::BufMut + Send)) -> {anyhow}::Result<Option<{wrpc_transport}::AsyncValue>> {{
         let span = {tracing}::trace_span!("encode");
         let _enter = span.enter();
-        self.handle.encode(payload).await
+        self.0.encode(payload).await
      }}
 }}
 
@@ -2312,9 +2285,7 @@ impl {wrpc_transport}::Encode for &{camel} {{
      async fn encode(self, payload: &mut (impl {bytes}::BufMut + Send)) -> {anyhow}::Result<Option<{wrpc_transport}::AsyncValue>> {{
         let span = {tracing}::trace_span!("encode");
         let _enter = span.enter();
-
-        let data: Vec<u8> = self.handle.as_ref().into();
-        data.encode(payload).await
+        self.0.as_str().encode(payload).await
      }}
 }}
 
@@ -2326,7 +2297,7 @@ impl {wrpc_transport}::Subscribe for &{camel} {{}}
 
 #[{async_trait}::async_trait]
 #[automatically_derived]
-impl<'a> {wrpc_transport}::Receive<'a> for {camel}{{
+impl<'a> {wrpc_transport}::Receive<'a> for {camel} {{
      async fn receive<T>(
         payload: impl {bytes}::Buf + Send + 'a,
         rx: &mut (impl {futures}::Stream<Item={anyhow}::Result<{bytes}::Bytes>> + Send + Sync + Unpin),
@@ -2338,9 +2309,28 @@ impl<'a> {wrpc_transport}::Receive<'a> for {camel}{{
         let span = {tracing}::trace_span!("receive");
         let _enter = span.enter();
         let (subject, payload) = {wrpc_transport}::Receive::receive(payload, rx, sub).await?;
-        Ok((Self {{ handle: subject }}, payload))
+        Ok((Self(subject), payload))
      }}
 }}
+"#
+            );
+        } else {
+            uwriteln!(
+                self.src,
+                r#"
+#[derive(Debug)]
+#[repr(transparent)]
+pub struct {camel};
+
+impl {camel} {{
+    /// Creates a new resource from the specified representation.
+    pub fn new() -> Self {{ Self {{ }} }}
+}}
+
+/// A borrowed version of [`{camel}`] which represents a borrowed value
+#[derive(Debug)]
+#[repr(transparent)]
+pub struct {camel}Borrow;
 
 #[{async_trait}::async_trait]
 #[automatically_derived]
@@ -2348,7 +2338,7 @@ impl {wrpc_transport}::Encode for {camel}Borrow {{
      async fn encode(self, payload: &mut (impl {bytes}::BufMut + Send)) -> {anyhow}::Result<Option<{wrpc_transport}::AsyncValue>> {{
         let span = {tracing}::trace_span!("encode");
         let _enter = span.enter();
-        self.handle.encode(payload).await
+        {anyhow}::bail!("exported resources not supported yet")
      }}
 }}
 
@@ -2358,9 +2348,7 @@ impl {wrpc_transport}::Encode for &{camel}Borrow {{
      async fn encode(self, payload: &mut (impl {bytes}::BufMut + Send)) -> {anyhow}::Result<Option<{wrpc_transport}::AsyncValue>> {{
         let span = {tracing}::trace_span!("encode");
         let _enter = span.enter();
-
-        let data: Vec<u8> = self.handle.as_ref().into();
-        data.encode(payload).await
+        {anyhow}::bail!("exported resources not supported yet")
      }}
 }}
 
@@ -2372,7 +2360,7 @@ impl {wrpc_transport}::Subscribe for &{camel}Borrow {{}}
 
 #[{async_trait}::async_trait]
 #[automatically_derived]
-impl<'a> {wrpc_transport}::Receive<'a> for {camel}Borrow{{
+impl<'a> {wrpc_transport}::Receive<'a> for {camel}Borrow {{
      async fn receive<T>(
         payload: impl {bytes}::Buf + Send + 'a,
         rx: &mut (impl {futures}::Stream<Item={anyhow}::Result<{bytes}::Bytes>> + Send + Sync + Unpin),
@@ -2383,23 +2371,53 @@ impl<'a> {wrpc_transport}::Receive<'a> for {camel}Borrow{{
      {{
         let span = {tracing}::trace_span!("receive");
         let _enter = span.enter();
-        let (subject, payload) = {wrpc_transport}::Receive::receive(payload, rx, sub).await?;
-        Ok((Self {{ handle: subject }}, payload))
+        {anyhow}::bail!("exported resources not supported yet")
      }}
 }}
-"#
-            );
-        } else {
-            uwriteln!(
-                self.src,
-                r#"
-                #[derive(Debug, Clone, Copy)]
-                pub struct {camel}Rep;
 
-                pub type {camel} = {wrpc_transport}::ResourceOwn<{camel}Rep>;
+#[{async_trait}::async_trait]
+#[automatically_derived]
+impl {wrpc_transport}::Encode for {camel} {{
+     async fn encode(self, payload: &mut (impl {bytes}::BufMut + Send)) -> {anyhow}::Result<Option<{wrpc_transport}::AsyncValue>> {{
+        let span = {tracing}::trace_span!("encode");
+        let _enter = span.enter();
+        {anyhow}::bail!("exported resources not supported yet")
+     }}
+}}
 
-                pub type {camel}Borrow = {wrpc_transport}::ResourceBorrow<{camel}Rep>;
-                "#
+#[{async_trait}::async_trait]
+#[automatically_derived]
+impl {wrpc_transport}::Encode for &{camel} {{
+     async fn encode(self, payload: &mut (impl {bytes}::BufMut + Send)) -> {anyhow}::Result<Option<{wrpc_transport}::AsyncValue>> {{
+        let span = {tracing}::trace_span!("encode");
+        let _enter = span.enter();
+        {anyhow}::bail!("exported resources not supported yet")
+     }}
+}}
+
+#[automatically_derived]
+impl {wrpc_transport}::Subscribe for {camel} {{}}
+
+#[automatically_derived]
+impl {wrpc_transport}::Subscribe for &{camel} {{}}
+
+#[{async_trait}::async_trait]
+#[automatically_derived]
+impl<'a> {wrpc_transport}::Receive<'a> for {camel} {{
+     async fn receive<T>(
+        payload: impl {bytes}::Buf + Send + 'a,
+        rx: &mut (impl {futures}::Stream<Item={anyhow}::Result<{bytes}::Bytes>> + Send + Sync + Unpin),
+        sub: Option<{wrpc_transport}::AsyncSubscription<T>>,
+     ) -> {anyhow}::Result<(Self, Box<dyn {bytes}::buf::Buf + Send + 'a>)>
+     where
+         T: {futures}::Stream<Item={anyhow}::Result<{bytes}::Bytes>> + Send + Sync + 'static
+     {{
+        let span = {tracing}::trace_span!("receive");
+        let _enter = span.enter();
+        {anyhow}::bail!("exported resources not supported yet")
+     }}
+}}
+"#,
             );
         }
     }
@@ -2407,9 +2425,9 @@ impl<'a> {wrpc_transport}::Receive<'a> for {camel}Borrow{{
     fn type_tuple(&mut self, id: TypeId, _name: &str, tuple: &Tuple, docs: &Docs) {
         for (name, mode) in self.modes_of(id) {
             self.rustdoc(docs);
-            self.push_str(&format!("pub type {name}"));
+            self.push_str(&format!("pub type {}", name));
             self.push_str(" = (");
-            for ty in &tuple.types {
+            for ty in tuple.types.iter() {
                 let mode = self.filter_mode(ty, mode);
                 self.print_ty(ty, mode);
                 self.push_str(",");
@@ -2529,7 +2547,7 @@ impl<'a> {wrpc_transport}::Receive<'a> for {camel}Borrow{{
     fn type_list(&mut self, id: TypeId, _name: &str, ty: &Type, docs: &Docs) {
         for (name, _) in self.modes_of(id) {
             self.rustdoc(docs);
-            self.push_str(&format!("pub type {name}"));
+            self.push_str(&format!("pub type {}", name));
             self.push_str(" = ");
             self.print_list(ty, TypeMode::owned());
             self.push_str(";\n");

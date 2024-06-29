@@ -1,4 +1,4 @@
-use heck::ToSnakeCase;
+use heck::*;
 use proc_macro::TokenStream;
 use std::env;
 

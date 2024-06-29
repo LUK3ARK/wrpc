@@ -12,7 +12,6 @@ authors = [
 
 categories.workspace = true
 edition.workspace = true
-homepage.workspace = true
 license.workspace = true
 repository.workspace = true
 
@@ -31,4 +30,4 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 test-helpers = { workspace = true }
 wit-bindgen-wrpc = { path = "../wit-bindgen" }
-wrpc-transport-legacy = { workspace = true }
+wrpc-transport = { workspace = true }
